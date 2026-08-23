@@ -1,16 +1,18 @@
 /*
  * NeoPixel Reader Board
  * Hardware: Arduino Mega
- * Layout:   7 independent strips, 291 LEDs each, wrapped in a circle
+ * Layout:   16 independent strips, 291 LEDs each (pins 2-13, A0-A3), stacked
+ *           top-to-bottom as one 16-row display. 8-bit tall font is scaled
+ *           2x vertically (each font row drawn on 2 strips).
  *
- * Text scrolls right to left. Configure via Serial at 9600 baud.
+ * Text scrolls left to right, letters mirrored horizontally. Configure via Serial at 9600 baud.
  */
 
 #include <Adafruit_NeoPixel.h>
 #include <EEPROM.h>
 
 // ── User config ───────────────────────────────────────────────────────────────
-#define NUM_ROWS                7
+#define NUM_ROWS                16
 #define NUM_COLS                291
 #define DEFAULT_BRIGHTNESS      40   // 0–255
 #define DEFAULT_SCROLL_DELAY_MS 40   // ms per scroll step
@@ -44,11 +46,7 @@ uint8_t  seqEnabled     = 0;
 uint8_t  seqIndex       = 0;      // currently-showing message (0-based)
 uint16_t seqDurationSec = 10;     // seconds to display each message
 
-enum DisplayState { STATE_SCROLL, STATE_WASH };
-DisplayState  displayState  = STATE_SCROLL;
 unsigned long stateStartMs  = 0;
-int           washFront     = 0;  // leading column of rainbow wash (0..NUM_COLS)
-uint16_t      washPhase     = 0;  // drives rainbow hue animation during wash
 
 // ── Color modes ───────────────────────────────────────────────────────────────
 enum ColorMode {
@@ -128,7 +126,7 @@ const ColorPreset solidColorPresets[10] = {
 };
 
 // ── Pin setup ─────────────────────────────────────────────────────────────────
-// Row 0 (top) … Row 6 (bottom); pins 2–8
+// 16 strips total: pins 2–13 (12 strips) and A0–A3 (4 strips)
 Adafruit_NeoPixel strips[NUM_ROWS] = {
   Adafruit_NeoPixel(NUM_COLS, 2, NEO_GRB + NEO_KHZ800),
   Adafruit_NeoPixel(NUM_COLS, 3, NEO_GRB + NEO_KHZ800),
@@ -137,6 +135,15 @@ Adafruit_NeoPixel strips[NUM_ROWS] = {
   Adafruit_NeoPixel(NUM_COLS, 6, NEO_GRB + NEO_KHZ800),
   Adafruit_NeoPixel(NUM_COLS, 7, NEO_GRB + NEO_KHZ800),
   Adafruit_NeoPixel(NUM_COLS, 8, NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_COLS, 9, NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_COLS, 10, NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_COLS, 11, NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_COLS, 12, NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_COLS, 13, NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_COLS, A0, NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_COLS, A1, NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_COLS, A2, NEO_GRB + NEO_KHZ800),
+  Adafruit_NeoPixel(NUM_COLS, A3, NEO_GRB + NEO_KHZ800),
 };
 
 // ── 5×8 font (ASCII 32–126) ───────────────────────────────────────────────────
@@ -243,6 +250,14 @@ static const uint8_t font5x8[][5] PROGMEM = {
 #define CHAR_SPACING 1
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Get mirrored font data: flip each character left-to-right.
+// For a 5-pixel-wide char, columns reverse: 0↔4, 1↔3, 2 stays.
+uint8_t getMirroredFontData(char c, int colInChar) {
+  if (c < 32 || c > 126) c = 32;
+  int mirroredCol = CHAR_WIDTH - 1 - colInChar;  // Mirror: 0→4, 1→3, 2→2, 3→1, 4→0
+  return pgm_read_byte(&font5x8[c - 32][mirroredCol]);
+}
 
 int messagePixelWidth() {
   int width = messageGap;
@@ -642,7 +657,7 @@ void handleSerial() {
       if (line.equals("3")) { promptFor(MENU_ACTION_SEQ_DURATION); return; }
       if (line.equals("4")) {
         seqEnabled = 1; saveSettings(); pendingAction = MENU_ACTION_NONE;
-        if (seqLength > 0) { loadSeqMessage(0); stateStartMs = millis(); displayState = STATE_SCROLL; }
+        if (seqLength > 0) { loadSeqMessage(0); stateStartMs = millis(); }
         Serial.println("Sequence enabled.");
         printFullMenuScreen(); return;
       }
@@ -703,10 +718,10 @@ void handleSerial() {
       if (line.equals("6")) { seqColorMode[pendingSlot] = COLOR_MODE_TWINKLE; seqRainbowFlow[pendingSlot] = 0; goto seqColorDone; }
       Serial.println("Choose 1-6. Or type 'cancel'."); return;
       seqColorDone:
-        saveSettings(); pendingAction = MENU_ACTION_NONE;
+        saveSettings();
         Serial.print("Slot "); Serial.print(pendingSlot + 1); Serial.print(" color: ");
         Serial.println(colorModeNameOf(seqColorMode[pendingSlot], seqRainbowFlow[pendingSlot]));
-        printFullMenuScreen(); return;
+        promptFor(MENU_ACTION_SEQUENCE); return;
     }
 
     if (pendingAction == MENU_ACTION_SEQ_SOLID_COLOR) {
@@ -716,10 +731,10 @@ void handleSerial() {
         seqSolidR[pendingSlot] = p.red;
         seqSolidG[pendingSlot] = p.green;
         seqSolidB[pendingSlot] = p.blue;
-        saveSettings(); pendingAction = MENU_ACTION_NONE;
+        saveSettings();
         Serial.print("Slot "); Serial.print(pendingSlot + 1); Serial.print(" color: ");
         Serial.println(p.name);
-        printFullMenuScreen();
+        promptFor(MENU_ACTION_SEQUENCE);
       } else Serial.println("Choose 1-10. Or type 'cancel'.");
       return;
     }
@@ -727,10 +742,10 @@ void handleSerial() {
     if (pendingAction == MENU_ACTION_SEQ_RAINBOW_STYLE) {
       if (line.equals("1") || line.equals("2")) {
         seqRainbowFlow[pendingSlot] = line.equals("2") ? 1 : 0;
-        saveSettings(); pendingAction = MENU_ACTION_NONE;
+        saveSettings();
         Serial.print("Slot "); Serial.print(pendingSlot + 1); Serial.print(" color: ");
         Serial.println(colorModeNameOf(seqColorMode[pendingSlot], seqRainbowFlow[pendingSlot]));
-        printFullMenuScreen();
+        promptFor(MENU_ACTION_SEQUENCE);
       } else Serial.println("Choose 1 or 2. Or type 'cancel'.");
       return;
     }
@@ -738,9 +753,9 @@ void handleSerial() {
     if (pendingAction == MENU_ACTION_SEQ_DURATION) {
       long v = line.toInt();
       if (v >= 1 && v <= 3600) {
-        seqDurationSec = (uint16_t)v; saveSettings(); pendingAction = MENU_ACTION_NONE;
+        seqDurationSec = (uint16_t)v; saveSettings();
         Serial.print("Duration set to "); Serial.print(seqDurationSec); Serial.println(" sec");
-        printFullMenuScreen();
+        promptFor(MENU_ACTION_SEQUENCE);
       } else Serial.println("Enter 1-3600. Or type 'cancel'.");
       return;
     }
@@ -760,22 +775,30 @@ void handleSerial() {
 }
 
 // Returns true if the pixel at (msgCol, row) in the scrolling message is lit.
+// Supports 16 stacked strips with 16-pixel-tall letters (2x vertical scaling of 8-bit font).
 bool msgPixel(int msgCol, int row) {
   if (row < 0 || row >= NUM_ROWS) return false;
+
+  // Map 16 display rows to 8 font rows (each font row gets 2 display rows).
+  // Rows 0-1 → font row 0, rows 2-3 → font row 1, etc.
+  int fontRow = row / 2;
+
   int total = messagePixelWidth();
   msgCol = ((msgCol % total) + total) % total;
 
   int textLength = (int)strlen(messageText);
   int scanCol = 0;
-  for (int i = 0; i < textLength; i++) {
+  // Walk the string back-to-front: the physical column flip in writeCol()
+  // reverses left/right, so laying characters out in reverse here is what
+  // makes the message read correctly on the board.
+  for (int i = textLength - 1; i >= 0; i--) {
     char c = messageText[i];
     int span = CHAR_WIDTH + CHAR_SPACING;
     if (msgCol < scanCol + span) {
       int colInChar = msgCol - scanCol;
       if (colInChar >= CHAR_WIDTH) return false;
-      if (c < 32 || c > 126) c = 32;
-      uint8_t colBits = pgm_read_byte(&font5x8[c - 32][colInChar]);
-      return ((colBits >> row) & 1) != 0;
+      uint8_t colBits = getMirroredFontData(c, colInChar);
+      return ((colBits >> fontRow) & 1) != 0;
     }
     scanCol += span;
   }
@@ -805,7 +828,6 @@ void setup() {
   if (seqEnabled && seqLength > 0) {
     loadSeqMessage(0);
     stateStartMs = millis();
-    displayState = STATE_SCROLL;
   }
 
   announceSerialIfReady();
@@ -821,45 +843,15 @@ void loop() {
   if (seqEnabled && seqLength > 0) {
     unsigned long now = millis();
 
-    if (displayState == STATE_SCROLL) {
-      // Render scrolling text normally.
-      for (int col = 0; col < NUM_COLS; col++)
-        for (int row = 0; row < NUM_ROWS; row++)
-          writeCol(row, col, msgPixel(col + scrollOffset, row));
+    // Render scrolling text normally.
+    for (int col = 0; col < NUM_COLS; col++)
+      for (int row = 0; row < NUM_ROWS; row++)
+        writeCol(row, col, msgPixel(col + scrollOffset, row));
 
-      // Time to transition?
-      if (now - stateStartMs >= (unsigned long)seqDurationSec * 1000UL) {
-        displayState = STATE_WASH;
-        washFront    = NUM_COLS;   // start on viewer's right, sweep left
-        washPhase    = 0;
-        // scrollOffset stays frozen so the rainbow erases static text
-      }
-
-    } else {  // STATE_WASH
-      // Rainbow sweeps right-to-left (same direction as text).
-      for (int col = 0; col < NUM_COLS; col++) {
-        for (int row = 0; row < NUM_ROWS; row++) {
-          if (col >= washFront) {
-            // Washed — full rainbow, no text.
-            uint16_t hue = (uint32_t)col * 65535UL / NUM_COLS + washPhase;
-            uint32_t color = strips[row].gamma32(strips[row].ColorHSV(hue));
-            strips[row].setPixelColor(NUM_COLS - 1 - col, color);
-          } else {
-            // Not yet washed — show frozen text.
-            writeCol(row, col, msgPixel(col + scrollOffset, row));
-          }
-        }
-      }
-
-      washFront -= 6;    // ~2 seconds to sweep 291 columns at 40 ms/frame
-      washPhase += 1351; // match hue flow to front speed (6 * 65535 / NUM_COLS)
-
-      if (washFront <= 0) {
-        // Wash complete — load next message and resume scrolling.
-        loadSeqMessage((seqIndex + 1) % seqLength);
-        displayState = STATE_SCROLL;
-        stateStartMs = millis();
-      }
+    // Time to move to the next message?
+    if (now - stateStartMs >= (unsigned long)seqDurationSec * 1000UL) {
+      loadSeqMessage((seqIndex + 1) % seqLength);
+      stateStartMs = millis();
     }
 
   } else {
@@ -871,19 +863,16 @@ void loop() {
 
   for (int r = 0; r < NUM_ROWS; r++) strips[r].show();
 
-  // Advance color phase (not during wash — the wash has its own washPhase).
-  if (displayState != STATE_WASH) {
-    if      (colorMode == COLOR_MODE_CYCLE)                       colorPhase += 512;
-    else if (colorMode == COLOR_MODE_RAINBOW && rainbowFlow)      colorPhase += 256;
-    else if (colorMode == COLOR_MODE_FIRE)                        colorPhase += 192;
-    else if (colorMode == COLOR_MODE_STRIPES)                     colorPhase += 384;
-    else if (colorMode == COLOR_MODE_TWINKLE)                     colorPhase += 256;
-  }
+  // Advance color phase.
+  if      (colorMode == COLOR_MODE_CYCLE)                       colorPhase += 512;
+  else if (colorMode == COLOR_MODE_RAINBOW && rainbowFlow)      colorPhase += 256;
+  else if (colorMode == COLOR_MODE_FIRE)                        colorPhase += 192;
+  else if (colorMode == COLOR_MODE_STRIPES)                     colorPhase += 384;
+  else if (colorMode == COLOR_MODE_TWINKLE)                     colorPhase += 256;
 
-  // Advance scroll (frozen during wash so the rainbow erases static letters).
-  if (displayState == STATE_SCROLL) {
-    scrollOffset = (scrollOffset + 1) % messagePixelWidth();
-  }
+  // Advance scroll.
+  int width = messagePixelWidth();
+  scrollOffset = (scrollOffset - 1 + width) % width;
 
   delay(scrollDelayMs);
 }
