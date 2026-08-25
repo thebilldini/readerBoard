@@ -13,9 +13,9 @@
 
 // ── User config ───────────────────────────────────────────────────────────────
 #define NUM_ROWS                16
-#define NUM_COLS                291
+#define NUM_COLS                29
 #define DEFAULT_BRIGHTNESS      40   // 0–255
-#define DEFAULT_SCROLL_DELAY_MS 40   // ms per scroll step
+#define DEFAULT_SCROLL_DELAY_MS 400  // ms per scroll step
 #define DEFAULT_MESSAGE_GAP     12   // blank columns between repeats
 #define MESSAGE_CAPACITY        96
 #define MAX_SEQUENCE_MESSAGES   5
@@ -44,6 +44,7 @@ uint8_t  seqRainbowFlow[MAX_SEQUENCE_MESSAGES];
 uint8_t  seqLength      = 0;
 uint8_t  seqEnabled     = 0;
 uint8_t  seqIndex       = 0;      // currently-showing message (0-based)
+bool     seqAdvancePending = false; // duration elapsed; switch once scroll completes
 uint16_t seqDurationSec = 10;     // seconds to display each message
 
 unsigned long stateStartMs  = 0;
@@ -145,6 +146,117 @@ Adafruit_NeoPixel strips[NUM_ROWS] = {
   Adafruit_NeoPixel(NUM_COLS, A2, NEO_GRB + NEO_KHZ800),
   Adafruit_NeoPixel(NUM_COLS, A3, NEO_GRB + NEO_KHZ800),
 };
+
+const uint8_t stripPins[NUM_ROWS] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, A0, A1, A2, A3};
+
+// ── Parallel multi-strip driver (Renesas RA4M1 / Arduino UNO R4) ───────────────
+// Adafruit_NeoPixel::show() bit-bangs one strip at a time: ~8.7ms per 291-LED
+// strip at 800kHz, so 16 sequential calls cost ~140ms/frame regardless of the
+// configured scroll delay. On this board, many of the 16 pins share the same
+// physical GPIO port (its 16-bit output register can set/clear several pins in
+// a single instruction), so strips on the same port can be clocked out together
+// instead of one at a time. This groups strips by shared port and drives each
+// group in lockstep, cutting frame time roughly in proportion to group size.
+#if defined(ARDUINO_ARCH_RENESAS_UNO)
+
+#define NP_DEMCR           (*(volatile uint32_t *)0xE000EDFC)
+#define NP_DEMCR_TRCENA    (1 << 24)
+#define NP_DWT_CTRL        (*(volatile uint32_t *)0xE0001000)
+#define NP_DWT_CTRL_CYCCNTENA (1 << 0)
+#define NP_DWT_CYCCNT      (*(volatile uint32_t *)0xE0001004)
+#define NP_PORT_ADDR(pn)   (R_PORT0 + ((R_PORT1 - R_PORT0) * ((pn) >> 8u)))
+
+#define NP_F_CPU        48000000UL
+#define NP_CYCLES_T0H   (NP_F_CPU / 4000000)
+#define NP_CYCLES_T1H   (NP_F_CPU / 1250000)
+#define NP_CYCLES_BIT   (NP_F_CPU / 800000)
+
+struct NpPortGroup {
+  volatile uint16_t *posr;
+  volatile uint16_t *porr;
+  uint8_t  stripIndex[NUM_ROWS];
+  uint16_t bitMask[NUM_ROWS];
+  uint8_t  count;
+};
+
+NpPortGroup npGroups[NUM_ROWS];
+uint8_t     npGroupCount = 0;
+
+void npBuildPortGroups() {
+  npGroupCount = 0;
+  for (int r = 0; r < NUM_ROWS; r++) {
+    bsp_io_port_pin_t io = g_pin_cfg[stripPins[r]].pin;
+    volatile uint16_t *posr = &(NP_PORT_ADDR(io)->POSR);
+    volatile uint16_t *porr = &(NP_PORT_ADDR(io)->PORR);
+    uint16_t mask = (uint16_t)(1u << (io & 0xFF));
+
+    int g = -1;
+    for (int i = 0; i < npGroupCount; i++) {
+      if (npGroups[i].posr == posr) { g = i; break; }
+    }
+    if (g < 0) {
+      g = npGroupCount++;
+      npGroups[g].posr  = posr;
+      npGroups[g].porr  = porr;
+      npGroups[g].count = 0;
+    }
+    NpPortGroup &grp = npGroups[g];
+    grp.stripIndex[grp.count] = r;
+    grp.bitMask[grp.count]    = mask;
+    grp.count++;
+  }
+}
+
+// Sends all 16 strips' pixel buffers, grouped by shared GPIO port, in lockstep.
+void showStripsParallel() {
+  uint8_t *bufs[NUM_ROWS];
+  for (int r = 0; r < NUM_ROWS; r++) bufs[r] = strips[r].getPixels();
+  uint16_t numBytes = strips[0].numPixels() * 3;  // GRB, no white channel
+
+  noInterrupts();
+  NP_DEMCR |= NP_DEMCR_TRCENA;
+  NP_DWT_CTRL |= NP_DWT_CTRL_CYCCNTENA;
+
+  for (int g = 0; g < npGroupCount; g++) {
+    NpPortGroup &grp = npGroups[g];
+    uint16_t fullMask = 0;
+    for (int i = 0; i < grp.count; i++) fullMask |= grp.bitMask[i];
+
+    volatile uint16_t *posr = grp.posr;
+    volatile uint16_t *porr = grp.porr;
+    uint32_t cyc = NP_DWT_CYCCNT + NP_CYCLES_BIT;
+
+    for (uint16_t byteIdx = 0; byteIdx < numBytes; byteIdx++) {
+      for (uint8_t bitMaskInByte = 0x80; bitMaskInByte; bitMaskInByte >>= 1) {
+        // Compute which pins carry a "0" bit this period ahead of the timing-
+        // critical section below, so this work only adds harmless extra low
+        // time between bits rather than distorting the T0H/T1H pulse widths.
+        uint16_t zeroMask = 0;
+        for (int i = 0; i < grp.count; i++) {
+          if (!(bufs[grp.stripIndex[i]][byteIdx] & bitMaskInByte)) zeroMask |= grp.bitMask[i];
+        }
+
+        while (NP_DWT_CYCCNT - cyc < NP_CYCLES_BIT) ;
+        cyc = NP_DWT_CYCCNT;
+        *posr = fullMask;                                    // all pins high
+        while (NP_DWT_CYCCNT - cyc < NP_CYCLES_T0H) ;
+        *porr = zeroMask;                                     // "0" pins low
+        while (NP_DWT_CYCCNT - cyc < NP_CYCLES_T1H) ;
+        *porr = fullMask;                                     // remaining pins low
+      }
+    }
+    while (NP_DWT_CYCCNT - cyc < NP_CYCLES_BIT) ;
+  }
+
+  interrupts();
+}
+
+#else
+void npBuildPortGroups() {}
+void showStripsParallel() {
+  for (int r = 0; r < NUM_ROWS; r++) strips[r].show();
+}
+#endif
 
 // ── 5×8 font (ASCII 32–126) ───────────────────────────────────────────────────
 // Each char = 5 bytes (one per column). Bit 0 = top row, bit 7 = bottom row.
@@ -662,7 +774,7 @@ void handleSerial() {
         printFullMenuScreen(); return;
       }
       if (line.equals("5")) {
-        seqEnabled = 0; saveSettings(); pendingAction = MENU_ACTION_NONE;
+        seqEnabled = 0; seqAdvancePending = false; saveSettings(); pendingAction = MENU_ACTION_NONE;
         Serial.println("Sequence disabled.");
         printFullMenuScreen(); return;
       }
@@ -675,7 +787,7 @@ void handleSerial() {
           seqSolidB[i]       = DEFAULT_TEXT_B;
           seqRainbowFlow[i]  = 0;
         }
-        seqLength = 0; seqEnabled = 0; saveSettings(); pendingAction = MENU_ACTION_NONE;
+        seqLength = 0; seqEnabled = 0; seqAdvancePending = false; saveSettings(); pendingAction = MENU_ACTION_NONE;
         Serial.println("Sequence cleared.");
         printFullMenuScreen(); return;
       }
@@ -822,7 +934,9 @@ void setup() {
   unsigned long start = millis();
   while (!Serial && millis() - start < 2000) {}
 
-  for (int r = 0; r < NUM_ROWS; r++) { strips[r].begin(); strips[r].show(); }
+  for (int r = 0; r < NUM_ROWS; r++) strips[r].begin();
+  npBuildPortGroups();
+  showStripsParallel();
   applyBrightness();
 
   if (seqEnabled && seqLength > 0) {
@@ -848,10 +962,10 @@ void loop() {
       for (int row = 0; row < NUM_ROWS; row++)
         writeCol(row, col, msgPixel(col + scrollOffset, row));
 
-    // Time to move to the next message?
-    if (now - stateStartMs >= (unsigned long)seqDurationSec * 1000UL) {
-      loadSeqMessage((seqIndex + 1) % seqLength);
-      stateStartMs = millis();
+    // Duration elapsed — don't cut the message off mid-scroll; wait for the
+    // current pass to finish (see scroll-advance below) before switching.
+    if (!seqAdvancePending && now - stateStartMs >= (unsigned long)seqDurationSec * 1000UL) {
+      seqAdvancePending = true;
     }
 
   } else {
@@ -861,7 +975,7 @@ void loop() {
         writeCol(row, col, msgPixel(col + scrollOffset, row));
   }
 
-  for (int r = 0; r < NUM_ROWS; r++) strips[r].show();
+  showStripsParallel();
 
   // Advance color phase.
   if      (colorMode == COLOR_MODE_CYCLE)                       colorPhase += 512;
@@ -870,9 +984,17 @@ void loop() {
   else if (colorMode == COLOR_MODE_STRIPES)                     colorPhase += 384;
   else if (colorMode == COLOR_MODE_TWINKLE)                     colorPhase += 256;
 
-  // Advance scroll.
-  int width = messagePixelWidth();
-  scrollOffset = (scrollOffset - 1 + width) % width;
+  // Advance scroll. scrollOffset == 0 is the seam where the message (and its
+  // trailing gap) has fully scrolled off — the only point it's safe to swap
+  // in the next sequence message without cutting text off mid-scroll.
+  if (seqEnabled && seqLength > 0 && seqAdvancePending && scrollOffset == 0) {
+    loadSeqMessage((seqIndex + 1) % seqLength);
+    stateStartMs = millis();
+    seqAdvancePending = false;
+  } else {
+    int width = messagePixelWidth();
+    scrollOffset = (scrollOffset - 1 + width) % width;
+  }
 
   delay(scrollDelayMs);
 }
