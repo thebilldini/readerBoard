@@ -15,7 +15,7 @@
 #define NUM_ROWS                16
 #define NUM_COLS                29
 #define DEFAULT_BRIGHTNESS      40   // 0–255
-#define DEFAULT_SCROLL_DELAY_MS 400  // ms per scroll step
+#define DEFAULT_SCROLL_DELAY_MS 100  // ms per scroll step
 #define DEFAULT_MESSAGE_GAP     12   // blank columns between repeats
 #define MESSAGE_CAPACITY        96
 #define MAX_SEQUENCE_MESSAGES   5
@@ -371,11 +371,22 @@ uint8_t getMirroredFontData(char c, int colInChar) {
   return pgm_read_byte(&font5x8[c - 32][mirroredCol]);
 }
 
+int textPixelWidth() {
+  return (int)strlen(messageText) * (CHAR_WIDTH + CHAR_SPACING);
+}
+
+// While a sequence is running, the gap must be at least a screen-width so
+// there's a scroll position where the display is genuinely all-blank —
+// otherwise there's no clean moment to swap in the next message without
+// showing a spliced mix of both. Plain single-message mode keeps whatever
+// gap the user picked.
+int effectiveMessageGap() {
+  if (seqEnabled && seqLength > 0 && messageGap < NUM_COLS) return NUM_COLS;
+  return messageGap;
+}
+
 int messagePixelWidth() {
-  int width = messageGap;
-  int length = (int)strlen(messageText);
-  for (int i = 0; i < length; i++) width += CHAR_WIDTH + CHAR_SPACING;
-  return width;
+  return textPixelWidth() + effectiveMessageGap();
 }
 
 const char* colorModeName() {
@@ -659,7 +670,9 @@ const char* colorModeNameOf(uint8_t mode, uint8_t flow) {
   }
 }
 
-// Load a sequence slot into the active globals and reset scroll.
+// Load a sequence slot into the active globals. Caller is responsible for
+// setting scrollOffset afterward (e.g. to textPixelWidth() for a message
+// that eases in from blank, continuing the previous message's scroll).
 void loadSeqMessage(uint8_t index) {
   if (seqLength == 0) return;
   seqIndex = index % seqLength;
@@ -672,7 +685,6 @@ void loadSeqMessage(uint8_t index) {
   solidB      = seqSolidB[seqIndex];
   rainbowFlow = seqRainbowFlow[seqIndex];
   colorPhase  = 0;
-  scrollOffset = 0;
 }
 
 void handleSerial() {
@@ -768,8 +780,8 @@ void handleSerial() {
       if (line.equals("2")) { promptFor(MENU_ACTION_SEQ_SLOT); return; }
       if (line.equals("3")) { promptFor(MENU_ACTION_SEQ_DURATION); return; }
       if (line.equals("4")) {
-        seqEnabled = 1; saveSettings(); pendingAction = MENU_ACTION_NONE;
-        if (seqLength > 0) { loadSeqMessage(0); stateStartMs = millis(); }
+        seqEnabled = 1; seqAdvancePending = false; saveSettings(); pendingAction = MENU_ACTION_NONE;
+        if (seqLength > 0) { loadSeqMessage(0); scrollOffset = textPixelWidth(); stateStartMs = millis(); }
         Serial.println("Sequence enabled.");
         printFullMenuScreen(); return;
       }
@@ -941,6 +953,7 @@ void setup() {
 
   if (seqEnabled && seqLength > 0) {
     loadSeqMessage(0);
+    scrollOffset = textPixelWidth();
     stateStartMs = millis();
   }
 
@@ -984,11 +997,16 @@ void loop() {
   else if (colorMode == COLOR_MODE_STRIPES)                     colorPhase += 384;
   else if (colorMode == COLOR_MODE_TWINKLE)                     colorPhase += 256;
 
-  // Advance scroll. scrollOffset == 0 is the seam where the message (and its
-  // trailing gap) has fully scrolled off — the only point it's safe to swap
-  // in the next sequence message without cutting text off mid-scroll.
-  if (seqEnabled && seqLength > 0 && seqAdvancePending && scrollOffset == 0) {
+  // Advance scroll. scrollOffset == textPixelWidth() is the one point in the
+  // loop where every visible column falls in the (screen-width-or-wider) gap
+  // zone, i.e. the outgoing message has fully scrolled off and the display
+  // is genuinely blank — the only safe moment to swap in the next sequence
+  // message. Starting the new message at that same offset carries the scroll
+  // straight through, so it eases in from blank exactly like a continuation
+  // of one long string rather than popping into view.
+  if (seqEnabled && seqLength > 0 && seqAdvancePending && scrollOffset == textPixelWidth()) {
     loadSeqMessage((seqIndex + 1) % seqLength);
+    scrollOffset = textPixelWidth();
     stateStartMs = millis();
     seqAdvancePending = false;
   } else {
