@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Reader Board
+Comment=Control the NeoPixel reader board
+Exec=/home/subvideoplayer/Desktop/run_reader_board_gui.sh
+Icon=preferences-desktop-display
+Terminal=false
+Categories=Utility;
